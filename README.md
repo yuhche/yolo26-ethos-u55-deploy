@@ -1,154 +1,139 @@
 # yolo26-ethos-u55-deploy
 
-Deployment scaffold for **Ultralytics YOLO26 → INT8 TFLite → Arm Vela → Ethos-U55** targeting **Seeed Studio Grove Vision AI V2**.
+Deploy YOLO26 on ARM Ethos-U55 NPU (Grove Vision AI V2).
 
-## Status
+## Pipeline
 
-Implemented project structure, conversion/inspection scripts, Vela compile helper, host benchmark, and firmware-side preprocessing/postprocessing skeletons.
-
-## Repository Layout
-
-```text
-models/
-  pytorch/     # trained .pt models
-  onnx/        # exported ONNX models
-  tflite/      # INT8 TFLite models
-  vela/        # Vela-compiled TFLite models
-notebooks/
-  train_yolo26_colab.ipynb  # Colab training notebook
-datasets/
-  calibration_images/  # representative images for INT8 calibration
-scripts/
-  export_onnx.py
-  convert_tflite_int8.py
-  check_tflite_ops.py
-  check_sscma_yolo26_tflite.py
-  compile_vela.sh
-  benchmark_tflite.py
-  sscma_probe.py
-firmware/
-  model/
-  src/
-docs/
-  hardware_notes.md
-  benchmark_results.md
-PLAN.md
+```
+Train (.pt) → Export ONNX → Convert TFLite INT8 → Compile with Vela → Deploy
 ```
 
 ## Setup
 
 ```bash
-uv sync
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
 ```
 
-## End-to-End Model Pipeline
-### 0. Download person dataset from roboflow
+## 1. Train (Colab)
 
-[Download from Roboflow](https://universe.roboflow.com/hanzhou-7mktt/ssperson/dataset/7)
+Training runs on Google Colab (free T4 GPU) via
+[`notebooks/train_yolo26_colab.ipynb`](notebooks/train_yolo26_colab.ipynb):
 
-### 1. Train or fine-tune YOLO26
+1. Open the notebook in Colab (File → Upload notebook, or open from GitHub) and select a GPU runtime.
+2. Add your Roboflow API key as the Colab secret `ROBOFLOW_API_KEY`
+   (the notebook downloads the `ssperson` v7 dataset from Roboflow).
+3. Run all cells. `best.pt` is saved to Google Drive and downloaded.
+4. Place it at `models/pytorch/best.pt` (or pass its path to the steps below).
 
-Training runs on Colab (free T4 GPU): open
-[`notebooks/train_yolo26_colab.ipynb`](notebooks/train_yolo26_colab.ipynb) in Colab
-(File → Upload notebook, or open it from GitHub), add your Roboflow API key as the Colab secret
-`ROBOFLOW_API_KEY` (the notebook downloads the dataset from Roboflow), and run all cells.
-Copy the resulting `best.pt` to `models/pytorch/best.pt`.
+To use the dataset locally for calibration/prediction, download it from Roboflow into
+`datasets/ssperson.v7i.yolo26/`.
 
-### 2. Export ONNX
+## 2. Predict (PyTorch)
 
 ```bash
-python scripts/export_onnx.py \
-  --input models/pytorch/best.pt \
-  --output models/onnx/best.onnx \
-  --imgsz 320 \
-  --opset 13
+bash scripts/predict_yolo26.sh
 ```
 
-### 3. Convert to fully quantized INT8 TFLite
-
-Place 100–500 representative camera images in `datasets/calibration_images/`, then:
+Or directly:
 
 ```bash
-python scripts/convert_tflite_int8.py \
-  --input models/onnx/best.onnx \
-  --output models/tflite/best_int8.tflite \
-  --calibration-dataset datasets/calibration_images \
-  --imgsz 320
+yolo predict model=best.pt source=image.jpg imgsz=192 save=True
 ```
 
-### 4. Inspect TFLite ops and SSCMA YOLO26 layout
+## 3. Export
+
+### 3a. Prepare calibration data (once per dataset)
+
+Required for accurate INT8 quantization. Uses real validation images instead of
+generic noise.
 
 ```bash
-python scripts/check_tflite_ops.py models/tflite/best_int8.tflite
-python scripts/check_sscma_yolo26_tflite.py models/tflite/best_int8.tflite
+python scripts/prepare_calibration.py \
+    --images datasets/ssperson.v7i.yolo26/valid/images \
+    --imgsz 192 \
+    --n 100 \
+    --output calib_192.npy
 ```
 
-Important: SSCMA-Micro's native YOLO26 postprocess expects six outputs: three box maps and three class maps. See `docs/sscma_integration.md`.
-
-### 5. Compile with Arm Vela
-
-Grove Vision AI V2 uses Ethos-U55 64 MACs, so default accelerator config is `ethos-u55-64`:
+### 3b. Export to ONNX
 
 ```bash
-scripts/compile_vela.sh models/tflite/best_int8.tflite models/vela
+bash scripts/export_onnx.sh best.pt 192
+# output: best.onnx
 ```
 
-Override if needed:
+### 3c. Convert to INT8 TFLite
 
 ```bash
-ACCELERATOR=ethos-u55-64 OPTIMISE=Performance \
-  scripts/compile_vela.sh models/tflite/best_int8.tflite models/vela
+bash scripts/export_tflite.sh best.onnx calib_192.npy saved_model
+# output: saved_model/best_full_integer_quant.tflite
 ```
 
-### 6. Host smoke benchmark
+> **Note:** `yolo export format=tflite` is not used because it does not support
+> custom calibration data, which causes incorrect INT8 quantization.
+
+## 4. Predict (TFLite)
 
 ```bash
-python scripts/benchmark_tflite.py models/tflite/best_int8.tflite --runs 100
+python scripts/predict_tflite.py \
+    --model saved_model/best_full_integer_quant.tflite \
+    --source image.jpg \
+    --save
 ```
 
-Real performance must be measured on Grove Vision AI V2.
+Options:
 
-## Firmware Integration
+| Arg | Default | Description |
+|---|---|---|
+| `--model` | `saved_model/best_full_integer_quant.tflite` | TFLite model |
+| `--source` | — | Image file or directory |
+| `--conf` | `0.25` | Confidence threshold |
+| `--names` | `person` | Class names |
+| `--save` | off | Save annotated output |
+| `--show` | off | Display result window |
+| `--output` | `runs/tflite/predict` | Output directory |
 
-Implemented skeleton files:
-
-```text
-firmware/src/camera_preprocess.cc  # YUV422 → RGB int8 NHWC
-firmware/src/yolo_decode.cc        # raw YOLO output decode
-firmware/src/nms.cc                # per-class NMS
-firmware/src/inference.cc          # placeholder TFLite Micro/Ethos-U integration
-firmware/src/main.cc               # integration skeleton
-```
-
-After Vela compilation, generate a C array:
+## 5. Compile with Vela (Ethos-U55)
 
 ```bash
-cp models/vela/*_vela.tflite firmware/model/model_int8_vela.tflite
-cd firmware/model
-xxd -i model_int8_vela.tflite > model_data.cc
+bash scripts/compile_vela.sh saved_model/best_full_integer_quant.tflite output_vela
+# output: output_vela/best_full_integer_quant_vela.tflite
 ```
 
-Then wire/register the model through SSCMA-Micro where possible instead of custom firmware. Register it as model type `MA_MODEL_TYPE_YOLO26` / ID `14`.
+Key flags used internally:
 
-## Host Test with python-sscma
+| Flag | Value | Reason |
+|---|---|---|
+| `--accelerator-config` | `ethos-u55-128` | Grove Vision AI V2 has U55-128 (128 MACs) |
+| `--system-config` | `Ethos_U55_High_End_Embedded` | WE2 timing model (500 MHz, SRAM AXI0) |
+| `--memory-mode` | `Shared_Sram` | Weights in flash (AXI1), activations in SRAM (AXI0) |
 
-After flashing SSCMA firmware/model to Grove Vision AI V2:
+Expected output for this model (192×192, 1 class):
 
-```bash
-python scripts/sscma_probe.py --port /dev/ttyACM0 --invoke 1 --tscore 60 --tiou 50
+```
+NPU operators = 972  (97.1%)   backbone + neck + head convolutions
+CPU operators =  29  ( 2.9%)   baked-in NMS (TopK, GatherND, Cast, FloorMod)
+
+Total SRAM used        321 KiB
+Total Off-chip Flash  2196 KiB
+MACs                   236 M MACs/frame
 ```
 
-Continuous invoke:
+The 2.9% CPU fallback is the end-to-end NMS head — unavoidable with the default
+`end2end=True` export. Flash `output_vela/best_full_integer_quant_vela.tflite`
+to the device.
 
-```bash
-python scripts/sscma_probe.py --port /dev/ttyACM0 --invoke -1 --seconds 60
-```
+## Scripts
 
-## Notes
+Training lives in the Colab notebook above; the scripts cover everything after it.
 
-See:
-
-- `PLAN.md` for full deployment plan
-- `docs/hardware_notes.md` for target assumptions
-- `docs/sscma_integration.md` for SSCMA-Micro/python-sscma findings
-- `docs/benchmark_results.md` for benchmark tracking
+| Script | Description |
+|---|---|
+| `scripts/predict_yolo26.sh` | Quick PyTorch inference |
+| `scripts/prepare_calibration.py` | Build INT8 calibration dataset |
+| `scripts/export_onnx.sh` | Export `.pt` → ONNX |
+| `scripts/export_tflite.sh` | Convert ONNX → INT8 TFLite |
+| `scripts/compile_vela.sh` | Compile INT8 TFLite with Vela for Ethos-U55 |
+| `scripts/predict_tflite.py` | TFLite inference with bounding box output |

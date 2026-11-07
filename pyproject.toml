@@ -3,7 +3,7 @@ name = "yolo26-ethos-u55-deploy"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "==3.12.*"
 dependencies = [
     "ethos-u-vela>=5.0.0",
     "ultralytics>=8.3.0",
@@ -11,7 +11,7 @@ dependencies = [
     "onnxruntime>=1.18.0",
     "onnxsim>=0.4.36",
     "onnx2tf>=1.22.0",
-    "tensorflow>=2.16.0",
+    "tensorflow>=2.16.0,<2.20.0",
     "opencv-python>=4.9.0",
     "numpy>=1.26.0",
     "flatbuffers>=24.3.25",
